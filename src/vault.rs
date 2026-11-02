@@ -283,62 +283,49 @@ impl Vault {
             return Err(VaultError::InvalidInput("search query is empty"));
         }
         let mut results = Vec::new();
-        for path in self.list_notes(None)? {
+        // Batches keep the early exit of `limit` while still scanning each batch in parallel.
+        for batch in self.list_notes(None)?.chunks(SEARCH_BATCH) {
             if results.len() >= limit {
                 break;
             }
-            let content = std::fs::read_to_string(self.root.join(&path)).unwrap_or_default();
-            let haystack = format!("{}\n{}", path.to_lowercase(), content.to_lowercase());
-            if !terms.iter().all(|term| haystack.contains(term)) {
-                continue;
-            }
-            let matches = content
-                .lines()
-                .enumerate()
-                .filter(|(_, line)| {
-                    let lowercase_line = line.to_lowercase();
-                    terms.iter().any(|term| lowercase_line.contains(term))
-                })
-                .map(|(index, line)| SearchMatch {
-                    line: index + 1,
-                    text: line.trim_end().to_string(),
-                })
-                .collect();
-            results.push(SearchResult { path, matches });
+            results.extend(self.scan(batch, |path, content| search_note(path, content, &terms)));
         }
+        results.truncate(limit);
         Ok(results)
     }
 
     pub fn backlinks(&self, note: &str) -> Result<Vec<String>> {
         let (relative_path, _) = self.existing_note(note)?;
         let target = strip_markdown_extension(&relative_path.to_lowercase()).to_string();
-        let mut sources = Vec::new();
-        for path in self.list_notes(None)? {
-            if path == relative_path {
-                continue;
+        let candidates: Vec<String> = self
+            .list_notes(None)?
+            .into_iter()
+            .filter(|path| *path != relative_path)
+            .collect();
+        Ok(self.scan(&candidates, |path, content| {
+            // Cheap pre-check: a note without `[[` cannot link anywhere.
+            if !content.contains("[[") {
+                return None;
             }
-            let content = std::fs::read_to_string(self.root.join(&path)).unwrap_or_default();
-            let links_here = crate::markdown::extract_wikilinks(&content)
+            crate::markdown::extract_wikilinks(content)
                 .iter()
                 .any(|link| {
                     let link = link.replace('\\', "/").to_lowercase();
                     let link = strip_markdown_extension(link.trim_start_matches('/'));
-                    target == link || target.ends_with(&format!("/{link}"))
-                });
-            if links_here {
-                sources.push(path);
-            }
-        }
-        Ok(sources)
+                    target == link
+                        || target
+                            .strip_suffix(link)
+                            .is_some_and(|prefix| prefix.ends_with('/'))
+                })
+                .then(|| path.to_string())
+        }))
     }
 
     pub fn tags(&self) -> Result<BTreeMap<String, usize>> {
+        let notes = self.list_notes(None)?;
         let mut counts = BTreeMap::new();
-        for path in self.list_notes(None)? {
-            let content = std::fs::read_to_string(self.root.join(&path)).unwrap_or_default();
-            for tag in crate::markdown::extract_tags(&content) {
-                *counts.entry(tag).or_insert(0) += 1;
-            }
+        for tag in self.scan_all(&notes, |_, content| note_tags(content)) {
+            *counts.entry(tag).or_insert(0) += 1;
         }
         Ok(counts)
     }
@@ -346,20 +333,58 @@ impl Vault {
     pub fn notes_with_tag(&self, tag: &str) -> Result<Vec<String>> {
         let wanted = tag.trim().trim_start_matches('#').to_lowercase();
         let nested = format!("{wanted}/");
-        let mut notes = Vec::new();
-        for path in self.list_notes(None)? {
-            let content = std::fs::read_to_string(self.root.join(&path)).unwrap_or_default();
-            let has_tag = crate::markdown::extract_tags(&content)
+        let notes = self.list_notes(None)?;
+        Ok(self.scan(&notes, |path, content| {
+            note_tags(content)
                 .iter()
                 .any(|note_tag| {
                     let note_tag = note_tag.to_lowercase();
                     note_tag == wanted || note_tag.starts_with(&nested)
-                });
-            if has_tag {
-                notes.push(path);
+                })
+                .then(|| path.to_string())
+        }))
+    }
+
+    /// Reads every note in `paths` across threads and collects what `visit` returns, in input order.
+    fn scan<T: Send>(
+        &self,
+        paths: &[String],
+        visit: impl Fn(&str, &str) -> Option<T> + Sync,
+    ) -> Vec<T> {
+        self.scan_all(paths, |path, content| {
+            visit(path, content).into_iter().collect()
+        })
+    }
+
+    /// Like [`Self::scan`], but `visit` may return any number of items per note.
+    fn scan_all<T: Send>(
+        &self,
+        paths: &[String],
+        visit: impl Fn(&str, &str) -> Vec<T> + Sync,
+    ) -> Vec<T> {
+        let visit_chunk = |chunk: &[String]| -> Vec<T> {
+            let mut found = Vec::new();
+            for path in chunk {
+                let content = std::fs::read_to_string(self.root.join(path)).unwrap_or_default();
+                found.extend(visit(path, &content));
             }
+            found
+        };
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        if threads < 2 || paths.len() < PARALLEL_THRESHOLD {
+            return visit_chunk(paths);
         }
-        Ok(notes)
+        let chunk_size = paths.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = paths
+                .chunks(chunk_size)
+                .map(|chunk| scope.spawn(|| visit_chunk(chunk)))
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("note scan thread panicked"))
+                .collect()
+        })
     }
 
     pub fn note_info(&self, note: &str) -> Result<NoteInfo> {
@@ -374,6 +399,47 @@ impl Vault {
             path: relative_path,
         })
     }
+}
+
+/// Notes below this count are scanned on the calling thread; spawning threads would cost more.
+const PARALLEL_THRESHOLD: usize = 64;
+/// Number of notes searched per parallel batch before checking the result limit.
+const SEARCH_BATCH: usize = 512;
+
+/// Tags of a note, skipping the parse when nothing in it can be a tag.
+fn note_tags(content: &str) -> Vec<String> {
+    if content.contains('#') || content.starts_with("---") {
+        crate::markdown::extract_tags(content)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Matches a note against already-lowercased search terms, returning the matching lines.
+fn search_note(path: &str, content: &str, terms: &[String]) -> Option<SearchResult> {
+    let lower_path = path.to_lowercase();
+    let lower_content = content.to_lowercase();
+    if !terms
+        .iter()
+        .all(|term| lower_path.contains(term) || lower_content.contains(term))
+    {
+        return None;
+    }
+    // Lowercasing never adds or removes line breaks, so both texts split into the same lines.
+    let matches = content
+        .lines()
+        .zip(lower_content.lines())
+        .enumerate()
+        .filter(|(_, (_, lower_line))| terms.iter().any(|term| lower_line.contains(term)))
+        .map(|(index, (line, _))| SearchMatch {
+            line: index + 1,
+            text: line.trim_end().to_string(),
+        })
+        .collect();
+    Some(SearchResult {
+        path: path.to_string(),
+        matches,
+    })
 }
 
 fn strip_markdown_extension(path: &str) -> &str {
@@ -758,5 +824,102 @@ mod tests {
         assert_eq!(info.links, vec!["Other"]);
         assert_eq!(info.backlinks, vec!["Other.md"]);
         assert!(info.size_bytes > 0);
+    }
+
+    /// A vault big enough to take the parallel scan path and span several search batches.
+    fn large_vault(count: usize) -> (TempDir, Vault) {
+        let notes: Vec<(String, String)> = (0..count)
+            .map(|i| {
+                let content = format!(
+                    "---\ntags: [even{}]\n---\nNote number {i}\nlinks to [[note{:04}]] #inline{}\n",
+                    i % 2,
+                    (i + 1) % count,
+                    i % 3
+                );
+                (format!("folder{}/note{i:04}.md", i % 5), content)
+            })
+            .collect();
+        let files: Vec<(&str, &str)> = notes
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        vault_with(&files)
+    }
+
+    #[test]
+    fn search_in_a_large_vault_keeps_sorted_order() {
+        let (_directory, vault) = large_vault(PARALLEL_THRESHOLD * 4);
+        let results = vault.search("number", usize::MAX).unwrap();
+        assert_eq!(results.len(), PARALLEL_THRESHOLD * 4);
+        let paths: Vec<_> = results.iter().map(|result| result.path.clone()).collect();
+        assert_eq!(paths, vault.list_notes(None).unwrap());
+        assert_eq!(results[0].matches[0].line, 5 - 1);
+    }
+
+    #[test]
+    fn search_limit_applies_across_batches() {
+        let (_directory, vault) = large_vault(SEARCH_BATCH + 100);
+        let all = vault.search("number", usize::MAX).unwrap();
+        assert_eq!(all.len(), SEARCH_BATCH + 100);
+        for limit in [0, 1, SEARCH_BATCH, SEARCH_BATCH + 1] {
+            let limited = vault.search("number", limit).unwrap();
+            assert_eq!(limited, all[..limit].to_vec(), "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn search_lines_survive_unicode_and_crlf() {
+        let (_directory, vault) =
+            vault_with(&[("a.md", "İstanbul\r\nstraße nope\r\nSTRASSE-free STRAßE\r\n")]);
+        let results = vault.search("straße", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        let lines: Vec<_> = results[0]
+            .matches
+            .iter()
+            .map(|m| (m.line, m.text.as_str()))
+            .collect();
+        assert_eq!(lines, vec![(2, "straße nope"), (3, "STRASSE-free STRAßE")]);
+    }
+
+    #[test]
+    fn backlinks_in_a_large_vault_match_the_sequential_result() {
+        let (_directory, vault) = large_vault(PARALLEL_THRESHOLD * 3);
+        // note0007 (folder2) is linked only from note0006 (folder1).
+        assert_eq!(
+            vault.backlinks("folder2/note0007.md").unwrap(),
+            vec!["folder1/note0006.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn backlinks_ignore_notes_without_links() {
+        let (_directory, vault) = vault_with(&[("A.md", "no links"), ("B.md", "see [[A]]")]);
+        assert_eq!(vault.backlinks("A").unwrap(), vec!["B.md"]);
+    }
+
+    #[test]
+    fn tags_in_a_large_vault_are_counted_across_threads() {
+        let (_directory, vault) = large_vault(PARALLEL_THRESHOLD * 3);
+        let total = PARALLEL_THRESHOLD * 3;
+        let tags = vault.tags().unwrap();
+        assert_eq!(tags["even0"] + tags["even1"], total);
+        assert_eq!(tags["inline0"] + tags["inline1"] + tags["inline2"], total);
+    }
+
+    #[test]
+    fn notes_with_tag_in_a_large_vault_is_sorted_and_complete() {
+        let (_directory, vault) = large_vault(PARALLEL_THRESHOLD * 3);
+        let found = vault.notes_with_tag("#even0").unwrap();
+        assert_eq!(found.len(), PARALLEL_THRESHOLD * 3 / 2);
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(found, sorted);
+    }
+
+    #[test]
+    fn notes_without_any_tag_markers_are_skipped() {
+        assert!(note_tags("plain text, nothing to see").is_empty());
+        assert_eq!(note_tags("a #tag"), vec!["tag"]);
+        assert_eq!(note_tags("---\ntags: [x]\n---\nbody"), vec!["x"]);
     }
 }
