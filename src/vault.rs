@@ -362,23 +362,26 @@ impl Vault {
         paths: &[String],
         visit: impl Fn(&str, &str) -> Vec<T> + Sync,
     ) -> Vec<T> {
-        let visit_chunk = |chunk: &[String]| -> Vec<T> {
-            let mut found = Vec::new();
-            for path in chunk {
-                let content = std::fs::read_to_string(self.root.join(path)).unwrap_or_default();
-                found.extend(visit(path, &content));
-            }
-            found
-        };
         let threads = std::thread::available_parallelism().map_or(1, usize::from);
-        if !worth_parallel(threads, paths.len()) {
-            return visit_chunk(paths);
-        }
-        let chunk_size = paths.len().div_ceil(threads);
+        let (root, visit) = (&self.root, &visit);
+        let chunk_size = paths
+            .len()
+            .div_ceil(worker_count(threads, paths.len()))
+            .max(1);
         std::thread::scope(|scope| {
             let workers: Vec<_> = paths
                 .chunks(chunk_size)
-                .map(|chunk| scope.spawn(|| visit_chunk(chunk)))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        let mut found = Vec::new();
+                        for path in chunk {
+                            let content =
+                                std::fs::read_to_string(root.join(path)).unwrap_or_default();
+                            found.extend(visit(path, &content));
+                        }
+                        found
+                    })
+                })
                 .collect();
             workers
                 .into_iter()
@@ -403,9 +406,13 @@ impl Vault {
 
 /// Notes below this count are scanned on the calling thread; spawning threads would cost more.
 const PARALLEL_THRESHOLD: usize = 64;
-/// Whether `notes` notes are enough to repay the cost of spreading a scan over `threads` threads.
-fn worth_parallel(threads: usize, notes: usize) -> bool {
-    threads >= 2 && notes >= PARALLEL_THRESHOLD
+/// How many threads to spread a scan of `notes` notes over: small vaults stay on a single worker.
+fn worker_count(threads: usize, notes: usize) -> usize {
+    if notes < PARALLEL_THRESHOLD {
+        1
+    } else {
+        threads.max(1)
+    }
 }
 
 /// Number of notes searched per parallel batch before checking the result limit.
@@ -929,12 +936,18 @@ mod tests {
     }
 
     #[test]
-    fn parallel_scan_needs_several_threads_and_enough_notes() {
-        assert!(worth_parallel(2, PARALLEL_THRESHOLD));
-        assert!(worth_parallel(8, PARALLEL_THRESHOLD + 1));
-        assert!(!worth_parallel(1, PARALLEL_THRESHOLD));
-        assert!(!worth_parallel(0, PARALLEL_THRESHOLD));
-        assert!(!worth_parallel(2, PARALLEL_THRESHOLD - 1));
-        assert!(!worth_parallel(8, 0));
+    fn small_scans_use_one_worker_and_large_ones_use_every_thread() {
+        assert_eq!(worker_count(8, PARALLEL_THRESHOLD - 1), 1);
+        assert_eq!(worker_count(8, 0), 1);
+        assert_eq!(worker_count(8, PARALLEL_THRESHOLD), 8);
+        assert_eq!(worker_count(3, PARALLEL_THRESHOLD * 10), 3);
+        assert_eq!(worker_count(0, PARALLEL_THRESHOLD), 1);
+    }
+
+    #[test]
+    fn scanning_no_notes_returns_nothing() {
+        let (_directory, vault) = vault_with(&[]);
+        assert!(vault.tags().unwrap().is_empty());
+        assert!(vault.search("x", 5).unwrap().is_empty());
     }
 }
