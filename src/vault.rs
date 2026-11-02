@@ -371,7 +371,7 @@ impl Vault {
             found
         };
         let threads = std::thread::available_parallelism().map_or(1, usize::from);
-        if threads < 2 || paths.len() < PARALLEL_THRESHOLD {
+        if !worth_parallel(threads, paths.len()) {
             return visit_chunk(paths);
         }
         let chunk_size = paths.len().div_ceil(threads);
@@ -403,6 +403,11 @@ impl Vault {
 
 /// Notes below this count are scanned on the calling thread; spawning threads would cost more.
 const PARALLEL_THRESHOLD: usize = 64;
+/// Whether `notes` notes are enough to repay the cost of spreading a scan over `threads` threads.
+fn worth_parallel(threads: usize, notes: usize) -> bool {
+    threads >= 2 && notes >= PARALLEL_THRESHOLD
+}
+
 /// Number of notes searched per parallel batch before checking the result limit.
 const SEARCH_BATCH: usize = 512;
 
@@ -921,5 +926,15 @@ mod tests {
         assert!(note_tags("plain text, nothing to see").is_empty());
         assert_eq!(note_tags("a #tag"), vec!["tag"]);
         assert_eq!(note_tags("---\ntags: [x]\n---\nbody"), vec!["x"]);
+    }
+
+    #[test]
+    fn parallel_scan_needs_several_threads_and_enough_notes() {
+        assert!(worth_parallel(2, PARALLEL_THRESHOLD));
+        assert!(worth_parallel(8, PARALLEL_THRESHOLD + 1));
+        assert!(!worth_parallel(1, PARALLEL_THRESHOLD));
+        assert!(!worth_parallel(0, PARALLEL_THRESHOLD));
+        assert!(!worth_parallel(2, PARALLEL_THRESHOLD - 1));
+        assert!(!worth_parallel(8, 0));
     }
 }
